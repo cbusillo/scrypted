@@ -1,0 +1,2 @@
+# Needs the controller release with camera snapshots and Python 3.12 support.
+qolsys-controller>=1.10.0

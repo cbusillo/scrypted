@@ -1,0 +1,6 @@
+node_modules/
+out/
+dist/
+__pycache__/
+*.pyc
+src/fs/*.whl

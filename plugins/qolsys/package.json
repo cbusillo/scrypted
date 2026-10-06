@@ -1,0 +1,14 @@
+{
+  "name": "@scrypted/qolsys",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Local Qolsys panel pictures and experimental bounded live preview",
+  "scripts": {"build": "scrypted-webpack"},
+  "scrypted": {
+    "name": "Qolsys Panel Camera (local prototype)",
+    "runtime": "python",
+    "type": "Camera",
+    "interfaces": ["Camera", "VideoCamera", "Settings"]
+  },
+  "devDependencies": {"@scrypted/sdk": "0.5.59"}
+}
