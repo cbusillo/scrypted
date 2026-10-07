@@ -29,6 +29,9 @@ MAX_ENCODED_BYTES = 20_000_000
 # request timeout. Calibration and the viewer preview both stay inside this.
 MAX_PREVIEW_SECONDS = 12
 SNAPSHOT_INTERVAL_SECONDS = 30
+# Reuse the panel-minus-local clock offset learned from earlier files instead of
+# taking a snapshot before every chained preview segment.
+CLOCK_REUSE_SECONDS = 600
 
 
 class PanelClient:
@@ -52,6 +55,9 @@ class PanelClient:
         self.last_jpeg: bytes | None = None
         self.last_picture_time = 0.0
         self.snapshot_interval = SNAPSHOT_INTERVAL_SECONDS
+        self.clock_offset: float | None = None
+        self.clock_learned = 0.0
+        self.recording_started = 0.0
 
     async def connect(self):
         async with self.connection_lock:
@@ -123,6 +129,8 @@ class PanelClient:
             snapshot = await self.controller.commands.camera.capture_snapshot()
             self.last_jpeg = snapshot.jpeg
             self.last_picture_time = time.monotonic()
+            # Thumbnails keep the panel clock fresh so a later preview skips its clock picture.
+            self._learn_clock(int(snapshot.filename.removesuffix(".jpg").rsplit("_", 1)[1]), time.time())
             return snapshot.jpeg
 
     async def preflight(self) -> bool:
@@ -274,10 +282,12 @@ class PanelClient:
         async with self.camera_lock:
             resume_motion = await self.preflight()
             await self.connect()
-            clock_picture = await self.controller.commands.camera.capture_snapshot()
-            self.last_jpeg = clock_picture.jpeg
-            self.last_picture_time = time.monotonic()
-            native_epoch = int(clock_picture.filename.removesuffix(".jpg").rsplit("_", 1)[1])
+            if self.clock_offset is None or time.monotonic() - self.clock_learned >= CLOCK_REUSE_SECONDS:
+                # The panel clock drifts from ours; learn it from a fresh picture's filename.
+                clock_picture = await self.controller.commands.camera.capture_snapshot()
+                self.last_jpeg = clock_picture.jpeg
+                self.last_picture_time = time.monotonic()
+                self._learn_clock(int(clock_picture.filename.removesuffix(".jpg").rsplit("_", 1)[1]), time.time())
             ident = str(uuid.uuid4())
             now = int(time.time() * 1000)
             metadata = {"request_id": ident, "type": "PEEK_IN", "file_type": "LOCAL_VIDEO",
@@ -311,6 +321,7 @@ class PanelClient:
             failure: BaseException | None = None
             budget = asyncio.timeout(seconds)
             try:
+                self.recording_started = time.time()
                 await self.ipc(1, [{"dataType": "int", "dataValue": 0},
                                    {"dataType": "string", "dataValue": ident},
                                    {"dataType": "string", "dataValue": "/sdcard/PeekInPhotos"},
@@ -323,7 +334,9 @@ class PanelClient:
                         if filename:
                             raw = await self.read_video(filename)
                         else:
-                            for stamp in range(native_epoch - 2, native_epoch + 9):
+                            # Native time of the recording start, from the learned clock offset.
+                            expected = int(self.recording_started + self.clock_offset)
+                            for stamp in sorted(range(expected - 3, expected + 4), key=lambda v: abs(v - expected)):
                                 candidate = f"{ident}_{stamp}.mp4"
                                 raw = await self.read_video(candidate)
                                 if raw:
@@ -354,6 +367,10 @@ class PanelClient:
                 await emit(tail)
             return final_parameters
 
+    def _learn_clock(self, native_epoch: int, local_time: float):
+        self.clock_offset = native_epoch - local_time
+        self.clock_learned = time.monotonic()
+
     async def _finish_preview(self, ident, filename, reader, guard, resume_motion):
         stopped = await self.stop_recording(ident, resume_motion)
         # Keep the watchdog while an alarm holds off stopping our recording.
@@ -373,6 +390,7 @@ class PanelClient:
             await asyncio.sleep(0.25)
         if not isinstance(filename, str) or not re.fullmatch(re.escape(ident) + r"_[0-9]+\.mp4", filename):
             raise RuntimeError("Preview callback filename unavailable")
+        self._learn_clock(int(filename.removesuffix(".mp4").rsplit("_", 1)[1]), self.recording_started)
         try:
             raw = await self.read_video(filename)
             if raw is None:

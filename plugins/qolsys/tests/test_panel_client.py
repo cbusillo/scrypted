@@ -285,3 +285,12 @@ async def test_cleanup_video_tolerates_eventually_consistent_readback(client, mo
     client.request = request
     await client.cleanup_video(ident, name)  # must not raise despite first stale read
     assert ipc_calls == [7] and reads["video"] > 1 and reads["row"] > 1
+
+
+@pytest.mark.asyncio
+async def test_chained_preview_reuses_panel_clock_instead_of_new_snapshot(client):
+    await client.capture_preview(4)
+    client.removed = client.deleted = client.stopped = False
+    await client.capture_preview(4)
+    assert client.controller.commands.camera.capture_snapshot.await_count == 1
+    assert client.removed and client.deleted

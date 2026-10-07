@@ -25,6 +25,10 @@ from camera_h264 import H264Parameters
 from panel_client import SNAPSHOT_INTERVAL_SECONDS, PanelClient
 from preview_server import PreviewServer
 
+# Chain bounded recordings while someone watches, capped so the panel's camera
+# motion detection is never paused for long.
+MAX_VIEW_SECONDS = 300
+
 
 class PanelOnlyPairing(QolsysPairingServer):
     async def handle_client(self, reader, writer):
@@ -94,7 +98,7 @@ class QolsysCamera(scrypted_sdk.ScryptedDeviceBase, Camera, VideoCamera, Setting
         parameters = self._parameters()
         if self.storage.getItem("previewEnabled") != "true" or not parameters:
             return []
-        return [{"id": "native-preview", "name": "Experimental 12-second live preview",
+        return [{"id": "native-preview", "name": "Live preview",
                  "container": "h264", "video": {"codec": "h264", "width": 1280, "height": 720,
                                                    "fps": round(parameters.frame_rate or 10)}, "audio": None}]
 
@@ -111,8 +115,18 @@ class QolsysCamera(scrypted_sdk.ScryptedDeviceBase, Camera, VideoCamera, Setting
         if options and options.get("id") not in (None, "native-preview"):
             raise ValueError("Unknown video stream")
         if self.session and not self.session.finished.is_set():
-            raise RuntimeError("Only one live preview viewer is supported")
-        self.session = PreviewServer(await self._get_client(), self._parameters())
+            # A session that outlives the viewing cap is stuck; never let it block later views.
+            if asyncio.get_running_loop().time() - self.session.started_at > MAX_VIEW_SECONDS + 90:
+                await self.session.close()
+            else:
+                raise RuntimeError("Only one live preview viewer is supported")
+        parameters = self._parameters()
+        client = await self._get_client()
+        # Scrypted's ffmpeg re-encodes the bursty panel video into a steady stream.
+        ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
+        self.session = PreviewServer(client, parameters, max_view_seconds=MAX_VIEW_SECONDS,
+                                     fps=round(parameters.frame_rate or 10), ffmpeg=ffmpeg,
+                                     initial_jpeg=client.last_jpeg, log=self.print)
         url = await self.session.start()
         self._session_watch = asyncio.create_task(self._save_session_parameters(self.session))
         # The generated Python TypedDict makes TypeScript's optional FFmpeg
@@ -141,7 +155,7 @@ class QolsysCamera(scrypted_sdk.ScryptedDeviceBase, Camera, VideoCamera, Setting
              "description": "Each snapshot writes and deletes a file on the panel. Viewers share the latest image."},
             {"key": "previewEnabled", "title": "Experimental live preview", "type": "boolean",
              "value": self.storage.getItem("previewEnabled") == "true",
-             "description": "One 12-second view while disarmed on mains power. Pauses panel camera motion only if it was on; downloads can lag. Continuous recording is not supported."},
+             "description": "Live view while disarmed on mains power, up to 5 minutes, chained from short recordings with brief freezes between them. Pauses panel camera motion while watching. Continuous recording is not supported."},
             {"key": "calibrate", "title": "Calibrate video", "type": "button",
              "description": "Record and remove one eight-second clip to prepare the live decoder. Panel must be disarmed."},
         ]
