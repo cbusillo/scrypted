@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import secrets
@@ -46,6 +47,10 @@ class QolsysCamera(scrypted_sdk.ScryptedDeviceBase, Camera, VideoCamera, Setting
         self.session = None
         self._session_watch = None
         self.configuration_lock = asyncio.Lock()
+        self.view_lock = asyncio.Lock()
+        self._presence = None
+        with contextlib.suppress(RuntimeError):  # No loop yet; the first request starts it.
+            self._ensure_presence()
 
     def _parameters(self):
         value = self.storage.getItem("codecParameters")
@@ -84,7 +89,23 @@ class QolsysCamera(scrypted_sdk.ScryptedDeviceBase, Camera, VideoCamera, Setting
         directory = Path(os.environ["SCRYPTED_PLUGIN_VOLUME"]) / "qolsys"
         self.client = PanelClient(directory, host, local, remote)
         self.client.snapshot_interval = self._snapshot_interval()
+        self.client.log = self.print
+        self._ensure_presence()
         return self.client
+
+    def _ensure_presence(self):
+        # Stay signed in so the panel lists this remote as Active between requests.
+        if self._presence is None or self._presence.done():
+            self._presence = asyncio.get_running_loop().create_task(self._stay_signed_in())
+
+    async def _stay_signed_in(self):
+        while True:
+            try:
+                if self.storage.getItem("panelIp") and self.storage.getItem("remoteMac"):
+                    await (await self._get_client()).connect()
+            except Exception as err:
+                self.print(f"Panel sign-in failed, retrying: {err}")
+            await asyncio.sleep(60)
 
     async def getPictureOptions(self):
         return [{"id": "panel", "name": "Panel camera", "width": 1280, "height": 720}]
@@ -114,21 +135,21 @@ class QolsysCamera(scrypted_sdk.ScryptedDeviceBase, Camera, VideoCamera, Setting
             raise RuntimeError("Enable experimental preview and calibrate video first")
         if options and options.get("id") not in (None, "native-preview"):
             raise ValueError("Unknown video stream")
-        if self.session and not self.session.finished.is_set():
-            # A session that outlives the viewing cap is stuck; never let it block later views.
-            if asyncio.get_running_loop().time() - self.session.started_at > MAX_VIEW_SECONDS + 90:
+        async with self.view_lock:
+            if self.session and not self.session.finished.is_set():
+                # Home restarts a stream by asking again before it drops the old one.
+                # The panel camera serves one viewer, so the newest request takes over.
+                self.print("new viewer request; ending the current preview")
                 await self.session.close()
-            else:
-                raise RuntimeError("Only one live preview viewer is supported")
-        parameters = self._parameters()
-        client = await self._get_client()
-        # Scrypted's ffmpeg re-encodes the bursty panel video into a steady stream.
-        ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
-        self.session = PreviewServer(client, parameters, max_view_seconds=MAX_VIEW_SECONDS,
-                                     fps=round(parameters.frame_rate or 10), ffmpeg=ffmpeg,
-                                     initial_jpeg=client.last_jpeg, log=self.print)
-        url = await self.session.start()
-        self._session_watch = asyncio.create_task(self._save_session_parameters(self.session))
+            parameters = self._parameters()
+            client = await self._get_client()
+            # Scrypted's ffmpeg re-encodes the bursty panel video into a steady stream.
+            ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
+            self.session = PreviewServer(client, parameters, max_view_seconds=MAX_VIEW_SECONDS,
+                                         fps=round(parameters.frame_rate or 10), ffmpeg=ffmpeg,
+                                         initial_jpeg=client.last_jpeg, log=self.print)
+            url = await self.session.start()
+            self._session_watch = asyncio.create_task(self._save_session_parameters(self.session))
         # The generated Python TypedDict makes TypeScript's optional FFmpeg
         # keys required. This payload follows the actual optional-field API.
         ffmpeg_input = cast(FFmpegInput, {

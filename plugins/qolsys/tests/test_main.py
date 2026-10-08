@@ -90,3 +90,33 @@ async def test_stream_uses_recorded_frame_rate(camera):
     await camera.putSetting("previewEnabled", True)
     camera._save_parameters(H264Parameters(4, (b"\x67sps", b"\x68pps"), 15.0))
     assert (await camera.getVideoStreamOptions())[0]["video"]["fps"] == 15
+
+
+@pytest.mark.asyncio
+async def test_new_viewer_request_takes_over_the_running_preview(camera, monkeypatch):
+    import main
+    await camera.putSetting("previewEnabled", True)
+    camera._save_parameters(H264Parameters(4, (b"\x67sps", b"\x68pps"), 10.0))
+    camera.client = SimpleNamespace(last_jpeg=None)
+    camera.print = lambda *args: None
+    scrypted_sdk.mediaManager.getFFmpegPath = AsyncMock(return_value="ffmpeg")
+    sessions = []
+
+    class Session:
+        def __init__(self, *args, **kwargs):
+            self.finished = asyncio.Event()
+            self.parameters = None
+            sessions.append(self)
+
+        async def start(self):
+            return "tcp://127.0.0.1:1"
+
+        async def close(self):
+            self.finished.set()
+
+    monkeypatch.setattr(main, "PreviewServer", Session)
+    await camera.getVideoStream()
+    await camera.getVideoStream()
+    assert len(sessions) == 2
+    assert sessions[0].finished.is_set() and not sessions[1].finished.is_set()
+    assert camera.session is sessions[1]

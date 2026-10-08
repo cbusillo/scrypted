@@ -294,3 +294,75 @@ async def test_chained_preview_reuses_panel_clock_instead_of_new_snapshot(client
     await client.capture_preview(4)
     assert client.controller.commands.camera.capture_snapshot.await_count == 1
     assert client.removed and client.deleted
+
+
+def signed_in_client(tmp_path, monkeypatch, connect_result):
+    c = PanelClient(tmp_path, "192.0.2.1", "192.0.2.2", "02:00:00:00:00:01")
+
+    class Transport:
+        exited = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            Transport.exited = True
+
+        async def subscribe(self, topic):
+            pass
+
+        @property
+        async def messages(self):
+            await asyncio.Future()
+            yield
+
+    c.transport_type = Transport
+    monkeypatch.setattr(c.controller, "mqtt_open_transport_task", AsyncMock(return_value=Transport()))
+
+    async def publish(client):
+        await asyncio.Future()
+
+    monkeypatch.setattr(c.controller, "mqtt_publish_task", publish)
+    c.controller.commands.panel.connect = AsyncMock(return_value=connect_result)
+    c.controller.commands.panel.pingevent = AsyncMock(return_value={})
+    return c
+
+
+@pytest.mark.asyncio
+async def test_connect_signs_in_and_keeps_pinging(tmp_path, monkeypatch):
+    c = signed_in_client(tmp_path, monkeypatch, {"responseStatus": True})
+    c.log = lambda line: None
+    c.controller.settings._mqtt_ping = 0.01
+    await c.connect()
+    await asyncio.sleep(0.05)
+    c.controller.commands.panel.connect.assert_awaited_once()
+    assert c.controller.commands.panel.pingevent.await_count >= 2
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_sign_in_never_breaks_the_camera_connection(tmp_path, monkeypatch):
+    c = signed_in_client(tmp_path, monkeypatch, {"responseStatus": False})
+    c.controller.commands.panel.connect.side_effect = RuntimeError("rejected")
+    c.log = lambda line: None
+    await c.connect()
+    await asyncio.sleep(0.02)
+    assert c.transport is not None and not c.transport_type.exited
+    assert all(not task.done() for task in c.tasks)
+    c.controller.commands.panel.pingevent.assert_awaited()
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_stops_when_the_connection_is_lost(tmp_path, monkeypatch):
+    c = signed_in_client(tmp_path, monkeypatch, {"responseStatus": "true"})
+    c.log = lambda line: None
+    c.controller.settings._mqtt_ping = 0.01
+    await c.connect()
+    c.tasks[1].cancel()  # The listener ends when the transport drops.
+    await asyncio.sleep(0.05)
+    assert c.tasks[-1].done()
+    pings = c.controller.commands.panel.pingevent.await_count
+    await asyncio.sleep(0.05)
+    assert c.controller.commands.panel.pingevent.await_count == pings
+    await c.close()

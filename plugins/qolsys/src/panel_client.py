@@ -32,6 +32,8 @@ SNAPSHOT_INTERVAL_SECONDS = 30
 # Reuse the panel-minus-local clock offset learned from earlier files instead of
 # taking a snapshot before every chained preview segment.
 CLOCK_REUSE_SECONDS = 600
+# Bound for the sign-in and ping replies, like the other panel requests.
+SIGN_IN_TIMEOUT_SECONDS = 8
 
 
 class PanelClient:
@@ -51,6 +53,7 @@ class PanelClient:
         self.transport = None
         self.tasks: list[asyncio.Task] = []
         self.connection_lock = asyncio.Lock()
+        self.log: Callable[[str], None] = print
         self.camera_lock = asyncio.Lock()
         self.last_jpeg: bytes | None = None
         self.last_picture_time = 0.0
@@ -81,6 +84,31 @@ class PanelClient:
 
             self.tasks = [asyncio.create_task(self.controller.mqtt_publish_task(client)),
                           asyncio.create_task(listen())]
+            # Sign in and ping like the SDK's own session, without its full database
+            # sync. The panel lists a remote as Active only while it pings. This is
+            # only for the panel's device list, so camera requests never wait on it.
+            self.tasks.append(asyncio.create_task(self._keep_active()))
+
+    async def _sign_in(self):
+        result = await self.controller.commands.panel.connect()
+        self.log(f"Panel sign-in: responseStatus={result.get('responseStatus')!r}, fields={sorted(result)}")
+
+    async def _keep_active(self):
+        try:
+            async with asyncio.timeout(SIGN_IN_TIMEOUT_SECONDS):
+                await self._sign_in()
+        except Exception as err:
+            self.log(f"Panel sign-in failed: {err!r}")
+        while True:
+            try:
+                async with asyncio.timeout(SIGN_IN_TIMEOUT_SECONDS):
+                    await self.controller.commands.panel.pingevent()
+            except Exception as err:
+                self.log(f"Panel ping failed: {err!r}")
+            await asyncio.sleep(self.controller.settings.mqtt_ping)
+            # Stop with the connection; the next request reconnects and signs in again.
+            if any(task.done() for task in self.tasks if task is not asyncio.current_task()):
+                return
 
     async def close(self):
         for task in self.tasks:
