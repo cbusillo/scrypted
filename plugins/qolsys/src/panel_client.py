@@ -148,6 +148,9 @@ class PanelClient:
         if cached := self._cached_picture():
             return cached
         if self.camera_lock.locked():
+            # A live view holds the camera; a slightly older picture beats a gray tile.
+            if self.last_jpeg:
+                return self.last_jpeg
             raise RuntimeError("Live preview is using the panel camera; retry after it ends")
         async with self.camera_lock:
             # Recheck after waiting for another picture request.

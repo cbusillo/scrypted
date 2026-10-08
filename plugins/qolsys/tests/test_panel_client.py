@@ -103,6 +103,14 @@ async def test_busy_camera_does_not_capture(client):
 
 
 @pytest.mark.asyncio
+async def test_busy_camera_serves_the_last_picture(client):
+    client.last_jpeg = b"older jpeg"
+    async with client.camera_lock:
+        assert await client.take_picture() == b"older jpeg"
+    client.controller.commands.camera.capture_snapshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_armed_panel_never_starts(client):
     client.armed = True
     with pytest.raises(RuntimeError, match="disarmed"):

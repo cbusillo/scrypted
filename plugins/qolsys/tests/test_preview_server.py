@@ -256,29 +256,78 @@ async def test_frame_holder_processes_end_with_the_viewer(tmp_path):
     assert holder.decoder.returncode is not None and holder.encoder.returncode is not None
 
 
+def test_broadcast_sends_whole_units_and_starts_late_viewers_at_sps():
+    from frame_holder import Broadcast
+
+    class Writer:
+        def __init__(self):
+            self.data = bytearray()
+            self.transport = SimpleNamespace(get_write_buffer_size=lambda: 0)
+
+        def is_closing(self):
+            return False
+
+        def write(self, data):
+            self.data.extend(data)
+
+        def close(self):
+            pass
+
+    sps, pps, idr, p = b"\x67sps", b"\x68pps", b"\x65idr", b"\x41p"
+    stream = b"".join(b"\x00\x00\x00\x01" + unit for unit in (sps, pps, idr, p, sps, pps, idr, p))
+    broadcast, early, late = Broadcast(), Writer(), Writer()
+    broadcast.add(early)
+    broadcast.feed(stream[:30])  # split mid-unit
+    broadcast.add(late)
+    broadcast.feed(stream[30:] + b"\x00\x00\x00\x01")  # the next start code completes the last unit
+    units = lambda data: [u for u in bytes(data).split(b"\x00\x00\x00\x01") if u]
+    assert units(early.data) == [sps, pps, idr, p, sps, pps, idr, p]
+    assert units(late.data) == [sps, pps, idr, p]
+
+
 @pytest.mark.asyncio
 @pytest.mark.skipif(__import__("shutil").which("ffmpeg") is None, reason="needs ffmpeg")
-async def test_holder_process_writes_steady_stream_to_viewer_socket(tmp_path):
+async def test_holder_process_shares_one_steady_stream_with_every_viewer(tmp_path):
     import socket
 
     from frame_holder import HolderProcess
     data = sample_h264(tmp_path)
-    ours, viewer = socket.socketpair()
-    reader, _ = await asyncio.open_connection(sock=viewer)
-    holder = HolderProcess("ffmpeg", ours, fps=10, log=lambda line: None)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    port = listener.getsockname()[1]
+    holder = HolderProcess("ffmpeg", listener, fps=10, log=lambda line: None)
     await holder.start()
+    listener.close()
+
+    async def watch(delay):
+        await asyncio.sleep(delay)
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        received = bytearray()
+        loop = asyncio.get_running_loop()
+        end = loop.time() + 2.5
+        while loop.time() < end:
+            try:
+                received.extend(await asyncio.wait_for(reader.read(65536), 0.3))
+            except TimeoutError:
+                pass
+        writer.close()
+        return bytes(received)
+
+    viewers = asyncio.gather(watch(0), watch(1.2))
     await holder.feed(data[: len(data) // 2])
     await asyncio.sleep(1.5)  # panel-style silence
     await holder.feed(data[len(data) // 2:])
-    received = bytearray()
-    loop = asyncio.get_running_loop()
-    end = loop.time() + 1.0
-    while loop.time() < end:
-        try:
-            received.extend(await asyncio.wait_for(reader.read(65536), 0.3))
-        except TimeoutError:
-            break
-    await asyncio.wait_for(holder.close(), 10)  # never hangs on close
-    ours.close()
+    first, late = await viewers
+    for received in (first, late):
+        assert received.startswith(b"\x00\x00\x00\x01\x67")  # every viewer starts at a keyframe's SPS
+        probe = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries",
+            "stream=nb_read_frames", "-of", "csv=p=0", "-", stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE)
+        frames, _ = await probe.communicate(received)
+        assert int(frames.strip()) >= 8
+    # With every viewer gone, the holder ends on its own.
+    await asyncio.wait_for(holder.exited.wait(), 10)
+    await asyncio.wait_for(holder.close(), 10)
     assert holder.process.returncode is not None
-    assert len(received) > 10_000

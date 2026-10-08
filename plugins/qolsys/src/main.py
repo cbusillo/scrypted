@@ -136,20 +136,22 @@ class QolsysCamera(scrypted_sdk.ScryptedDeviceBase, Camera, VideoCamera, Setting
         if options and options.get("id") not in (None, "native-preview"):
             raise ValueError("Unknown video stream")
         async with self.view_lock:
-            if self.session and not self.session.finished.is_set():
-                # Home restarts a stream by asking again before it drops the old one.
-                # The panel camera serves one viewer, so the newest request takes over.
-                self.print("new viewer request; ending the current preview")
-                await self.session.close()
-            parameters = self._parameters()
-            client = await self._get_client()
-            # Scrypted's ffmpeg re-encodes the bursty panel video into a steady stream.
-            ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
-            self.session = PreviewServer(client, parameters, max_view_seconds=MAX_VIEW_SECONDS,
-                                         fps=round(parameters.frame_rate or 10), ffmpeg=ffmpeg,
-                                         initial_jpeg=client.last_jpeg, log=self.print)
-            url = await self.session.start()
-            self._session_watch = asyncio.create_task(self._save_session_parameters(self.session))
+            if self.session and self.session.joinable:
+                # Home often opens two streams for one camera, or asks again before it
+                # drops the old one. Every viewer shares the one panel recording.
+                url = self.session.url
+            else:
+                if self.session and not self.session.finished.is_set():
+                    await self.session.close()
+                parameters = self._parameters()
+                client = await self._get_client()
+                # Scrypted's ffmpeg re-encodes the bursty panel video into a steady stream.
+                ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
+                self.session = PreviewServer(client, parameters, max_view_seconds=MAX_VIEW_SECONDS,
+                                             fps=round(parameters.frame_rate or 10), ffmpeg=ffmpeg,
+                                             initial_jpeg=client.last_jpeg, log=self.print)
+                url = await self.session.start()
+                self._session_watch = asyncio.create_task(self._save_session_parameters(self.session))
         # The generated Python TypedDict makes TypeScript's optional FFmpeg
         # keys required. This payload follows the actual optional-field API.
         ffmpeg_input = cast(FFmpegInput, {

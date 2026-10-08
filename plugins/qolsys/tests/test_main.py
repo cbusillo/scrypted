@@ -93,7 +93,7 @@ async def test_stream_uses_recorded_frame_rate(camera):
 
 
 @pytest.mark.asyncio
-async def test_new_viewer_request_takes_over_the_running_preview(camera, monkeypatch):
+async def test_viewers_share_the_running_preview(camera, monkeypatch):
     import main
     await camera.putSetting("previewEnabled", True)
     camera._save_parameters(H264Parameters(4, (b"\x67sps", b"\x68pps"), 10.0))
@@ -106,17 +106,21 @@ async def test_new_viewer_request_takes_over_the_running_preview(camera, monkeyp
         def __init__(self, *args, **kwargs):
             self.finished = asyncio.Event()
             self.parameters = None
+            self.joinable = True
+            self.url = f"tcp://127.0.0.1:{len(sessions) + 1}"
             sessions.append(self)
 
         async def start(self):
-            return "tcp://127.0.0.1:1"
+            return self.url
 
         async def close(self):
             self.finished.set()
 
     monkeypatch.setattr(main, "PreviewServer", Session)
-    await camera.getVideoStream()
-    await camera.getVideoStream()
-    assert len(sessions) == 2
-    assert sessions[0].finished.is_set() and not sessions[1].finished.is_set()
-    assert camera.session is sessions[1]
+    first = await camera.getVideoStream()
+    second = await camera.getVideoStream()
+    assert len(sessions) == 1 and first["url"] == second["url"]
+    sessions[0].joinable = False  # e.g. its viewers left and it is shutting down
+    third = await camera.getVideoStream()
+    assert len(sessions) == 2 and sessions[0].finished.is_set()
+    assert third["url"] == sessions[1].url

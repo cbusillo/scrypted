@@ -7,7 +7,9 @@ picture, and re-encodes exactly `fps` pictures per second, repeating the last
 picture through gaps.
 
 The plugin runs it in its own process (HolderProcess) so panel downloads in
-the plugin's event loop cannot starve the steady clock.
+the plugin's event loop cannot starve the steady clock. That process owns the
+listening socket and sends the same stream to every viewer; Apple Home often
+opens two streams for one camera.
 """
 
 from __future__ import annotations
@@ -23,6 +25,13 @@ from collections.abc import Awaitable, Callable
 
 WIDTH, HEIGHT = 1280, 720
 FRAME_BYTES = WIDTH * HEIGHT * 3 // 2  # yuv420p
+# The child ends once no viewer has joined this long after start, or the last
+# viewer has been gone this long; Home reconnects within a second or two.
+FIRST_VIEWER_SECONDS = 15
+LAST_VIEWER_GRACE_SECONDS = 3
+# Drop a viewer that falls this far behind instead of buffering for it.
+MAX_VIEWER_BACKLOG = 4_000_000
+SPS = 7
 
 
 class FrameHolder:
@@ -56,7 +65,9 @@ class FrameHolder:
             self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "rawvideo", "-pix_fmt", "yuv420p",
             "-s", f"{WIDTH}x{HEIGHT}", "-r", str(self.fps), "-i", "pipe:0",
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-profile:v", "baseline",
-            "-g", str(self.fps), "-bf", "0", "-flush_packets", "1", "-f", "h264", "pipe:1",
+            # Repeat SPS/PPS before every keyframe so a viewer can join mid-stream.
+            "-g", str(self.fps), "-bf", "0", "-x264-params", "repeat-headers=1",
+            "-flush_packets", "1", "-f", "h264", "pipe:1",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         self.tasks = [asyncio.create_task(self._read_decoded()), asyncio.create_task(self._tick()),
                       asyncio.create_task(self._forward()),
@@ -135,21 +146,24 @@ class FrameHolder:
 
 
 class HolderProcess:
-    """Run FrameHolder in a child process that writes straight to the viewer's socket."""
+    """Run FrameHolder in a child process that accepts viewers on a listening socket."""
 
-    def __init__(self, ffmpeg: str, sock: socket.socket, fps: int = 10,
+    def __init__(self, ffmpeg: str, listener: socket.socket, fps: int = 10,
                  initial_jpeg: bytes | None = None, log: Callable[[str], None] = print):
         self.ffmpeg = ffmpeg
-        self.sock = sock
+        self.listener = listener
         self.fps = fps
         self.initial_jpeg = initial_jpeg
         self.log = log
         self.process: asyncio.subprocess.Process | None = None
         self.jpeg_path: str | None = None
         self.tasks: list[asyncio.Task] = []
+        # Set when the child exits and its stderr closes. Process.wait() would
+        # also wait for our open stdin pipe.
+        self.exited = asyncio.Event()
 
     async def start(self):
-        fd = self.sock.fileno()
+        fd = self.listener.fileno()
         args = [sys.executable, __file__, self.ffmpeg, str(self.fps), str(fd)]
         if self.initial_jpeg:
             handle, self.jpeg_path = tempfile.mkstemp(suffix=".jpg")
@@ -163,10 +177,15 @@ class HolderProcess:
 
     async def _log_stderr(self):
         assert self.process and self.process.stderr
-        while line := await self.process.stderr.readline():
-            self.log(line.decode(errors="replace").rstrip())
+        try:
+            while line := await self.process.stderr.readline():
+                self.log(line.decode(errors="replace").rstrip())
+        finally:
+            self.exited.set()
 
     async def feed(self, h264: bytes):
+        if self.exited.is_set():
+            raise ConnectionError("Every viewer has left")
         if self.process and self.process.stdin and not self.process.stdin.is_closing():
             self.process.stdin.write(h264)
             await self.process.stdin.drain()
@@ -192,23 +211,104 @@ class HolderProcess:
                 os.unlink(self.jpeg_path)
 
 
+class Broadcast:
+    """Send whole H264 NAL units to every viewer; a new viewer starts at the next SPS."""
+
+    def __init__(self):
+        self.viewers: dict[asyncio.StreamWriter, bool] = {}  # writer -> waiting for a keyframe
+        self.pending = bytearray()
+
+    def add(self, writer: asyncio.StreamWriter):
+        self.viewers[writer] = True
+
+    def remove(self, writer: asyncio.StreamWriter):
+        self.viewers.pop(writer, None)
+
+    def feed(self, data: bytes):
+        self.pending.extend(data)
+        starts = []
+        index = self.pending.find(b"\x00\x00\x01")
+        while index != -1:
+            starts.append(index)
+            index = self.pending.find(b"\x00\x00\x01", index + 3)
+        # The last unit is complete only once the next start code arrives.
+        for begin, end in zip(starts, starts[1:]):
+            self._send(bytes(self.pending[begin + 3:end]).rstrip(b"\x00"))
+        if starts:
+            del self.pending[:starts[-1]]
+
+    def _send(self, unit: bytes):
+        if not unit:
+            return
+        packet = b"\x00\x00\x00\x01" + unit
+        for writer, waiting in list(self.viewers.items()):
+            if waiting and unit[0] & 0x1F != SPS:
+                continue
+            if writer.is_closing() or writer.transport.get_write_buffer_size() > MAX_VIEWER_BACKLOG:
+                self.remove(writer)
+                writer.close()
+                continue
+            self.viewers[writer] = False
+            writer.write(packet)
+
+
 async def _child(ffmpeg: str, fps: int, fd: int, jpeg: bytes | None):
     loop = asyncio.get_running_loop()
+
+    def log(line: str):
+        print(line, file=sys.stderr, flush=True)
+
     reader = asyncio.StreamReader(limit=1 << 22)
     await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
-    # The viewer socket is inherited; write to it directly, never via the plugin.
-    _, writer = await asyncio.open_connection(sock=socket.socket(fileno=fd))
+    broadcast = Broadcast()
+    changed = asyncio.Event()
+
+    async def viewer(view_reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        broadcast.add(writer)
+        log(f"viewer joined; {len(broadcast.viewers)} watching")
+        changed.set()
+        with contextlib.suppress(Exception):
+            await view_reader.read()  # Viewers never send; this returns when one leaves.
+        broadcast.remove(writer)
+        writer.close()
+        log(f"viewer left; {len(broadcast.viewers)} watching")
+        changed.set()
+
+    # The listening socket is inherited; viewers connect here, never via the plugin.
+    server = await asyncio.start_server(viewer, sock=socket.socket(fileno=fd))
 
     async def output(chunk: bytes):
-        writer.write(chunk)
-        await writer.drain()
+        broadcast.feed(chunk)
 
-    holder = FrameHolder(ffmpeg, output, fps, jpeg, log=lambda line: print(line, file=sys.stderr, flush=True))
-    await holder.start()
-    try:
+    async def watch_viewers():
+        joined = False
+        while True:
+            changed.clear()
+            if broadcast.viewers:
+                joined = True
+                await changed.wait()
+                continue
+            try:
+                await asyncio.wait_for(changed.wait(), LAST_VIEWER_GRACE_SECONDS if joined else FIRST_VIEWER_SECONDS)
+            except TimeoutError:
+                log("no viewers; ending preview")
+                return
+
+    async def feed():
         while chunk := await reader.read(1 << 16):
             await holder.feed(chunk)
+
+    holder = FrameHolder(ffmpeg, output, fps, jpeg, log=log)
+    await holder.start()
+    tasks = [asyncio.create_task(watch_viewers()), asyncio.create_task(feed())]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
+        for task in tasks:
+            task.cancel()
+        server.close()
+        for writer in list(broadcast.viewers):
+            writer.close()
         await holder.close()
 
 
