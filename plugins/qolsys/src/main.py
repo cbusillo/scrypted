@@ -29,6 +29,9 @@ from preview_server import PreviewServer
 # Chain bounded recordings while someone watches, capped so the panel's camera
 # motion detection is never paused for long.
 MAX_VIEW_SECONDS = 300
+# Each poll downloads the whole growing clip, so short clips keep the last
+# full-file read inside the request timeout.
+SEGMENT_SECONDS = 6
 
 
 class PanelOnlyPairing(QolsysPairingServer):
@@ -147,7 +150,8 @@ class QolsysCamera(scrypted_sdk.ScryptedDeviceBase, Camera, VideoCamera, Setting
                 client = await self._get_client()
                 # Scrypted's ffmpeg re-encodes the bursty panel video into a steady stream.
                 ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
-                self.session = PreviewServer(client, parameters, max_view_seconds=MAX_VIEW_SECONDS,
+                self.session = PreviewServer(client, parameters, seconds=SEGMENT_SECONDS,
+                                             max_view_seconds=MAX_VIEW_SECONDS,
                                              fps=round(parameters.frame_rate or 10), ffmpeg=ffmpeg,
                                              initial_jpeg=client.last_jpeg, log=self.print)
                 url = await self.session.start()

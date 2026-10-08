@@ -93,7 +93,7 @@ class PreviewServer:
             # Feeding a holder whose viewers all left is a normal end.
             if not (isinstance(error, ConnectionError) and holder.exited.is_set()):
                 self.error = error
-                self.log(f"preview ended with error: {error!r}")
+                self.log(f"preview ended with error: {error!r}; cause: {error.__cause__!r}")
         finally:
             self.state = "Finishing preview"
             if not producer.done():
