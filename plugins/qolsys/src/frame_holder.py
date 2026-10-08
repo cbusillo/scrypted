@@ -32,6 +32,8 @@ LAST_VIEWER_GRACE_SECONDS = 3
 # Drop a viewer that falls this far behind instead of buffering for it.
 MAX_VIEWER_BACKLOG = 4_000_000
 SPS = 7
+BITRATE_KBPS = 1000
+KEYFRAME_SECONDS = 2
 
 
 class FrameHolder:
@@ -65,8 +67,11 @@ class FrameHolder:
             self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "rawvideo", "-pix_fmt", "yuv420p",
             "-s", f"{WIDTH}x{HEIGHT}", "-r", str(self.fps), "-i", "pipe:0",
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-profile:v", "baseline",
-            # Repeat SPS/PPS before every keyframe so a viewer can join mid-stream.
-            "-g", str(self.fps), "-bf", "0", "-x264-params", "repeat-headers=1",
+            # Home asks for a few hundred kbit/s and stalls on multi-megabit keyframe
+            # bursts, so cap the rate and send a keyframe every two seconds. Repeat
+            # SPS/PPS before every keyframe so a viewer can join mid-stream.
+            "-b:v", f"{BITRATE_KBPS}k", "-maxrate", f"{BITRATE_KBPS}k", "-bufsize", f"{BITRATE_KBPS}k",
+            "-g", str(self.fps * KEYFRAME_SECONDS), "-bf", "0", "-x264-params", "repeat-headers=1",
             "-flush_packets", "1", "-f", "h264", "pipe:1",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         self.tasks = [asyncio.create_task(self._read_decoded()), asyncio.create_task(self._tick()),
