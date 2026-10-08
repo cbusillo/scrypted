@@ -29,9 +29,9 @@ MAX_ENCODED_BYTES = 20_000_000
 # request timeout. Calibration and the viewer preview both stay inside this.
 MAX_PREVIEW_SECONDS = 12
 SNAPSHOT_INTERVAL_SECONDS = 30
-# Home gives up on a snapshot after about five seconds and panel stills can take
-# longer, so wait this long for a fresh one before answering with the latest.
-STALE_WAIT_SECONDS = 3
+# Scrypted gives up on a snapshot after about three seconds and panel stills
+# take longer, so wait this long for a fresh one before answering with the latest.
+STALE_WAIT_SECONDS = 2
 # A live view waits this long for a still capture to release the camera.
 CAMERA_WAIT_SECONDS = 12
 # Each poll downloads the whole growing clip; poll again almost at once, and
