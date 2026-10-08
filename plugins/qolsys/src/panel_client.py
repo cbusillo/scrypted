@@ -29,6 +29,11 @@ MAX_ENCODED_BYTES = 20_000_000
 # request timeout. Calibration and the viewer preview both stay inside this.
 MAX_PREVIEW_SECONDS = 12
 SNAPSHOT_INTERVAL_SECONDS = 30
+# Home gives up on a snapshot after about five seconds and panel stills can take
+# longer, so wait this long for a fresh one before answering with the latest.
+STALE_WAIT_SECONDS = 3
+# A live view waits this long for a still capture to release the camera.
+CAMERA_WAIT_SECONDS = 12
 # Each poll downloads the whole growing clip; poll again almost at once, and
 # recheck the arming and power state on a slower clock.
 POLL_PAUSE_SECONDS = 0.2
@@ -59,6 +64,7 @@ class PanelClient:
         self.connection_lock = asyncio.Lock()
         self.log: Callable[[str], None] = print
         self.cleanups: set[asyncio.Future] = set()
+        self.refresh: asyncio.Task | None = None
         self.camera_lock = asyncio.Lock()
         self.last_jpeg: bytes | None = None
         self.last_picture_time = 0.0
@@ -152,11 +158,45 @@ class PanelClient:
         # Each capture writes and deletes a panel file; serve recent images.
         if cached := self._cached_picture():
             return cached
-        if self.camera_lock.locked():
+        if self.camera_lock.locked() and (self.refresh is None or self.refresh.done()):
             # A live view holds the camera; a slightly older picture beats a gray tile.
             if self.last_jpeg:
                 return self.last_jpeg
             raise RuntimeError("Live preview is using the panel camera; retry after it ends")
+        refresh = self.refresh_picture()
+        if not self.last_jpeg:
+            return await refresh
+        # Answer within Home's patience; a slow capture still lands for the next request.
+        try:
+            return await asyncio.wait_for(asyncio.shield(refresh), STALE_WAIT_SECONDS)
+        except Exception:
+            return self.last_jpeg
+
+    def refresh_picture(self) -> asyncio.Task:
+        """Start a fresh capture unless one is already running."""
+        if self.refresh is None or self.refresh.done():
+            self.refresh = asyncio.create_task(self._capture_picture())
+
+            def done(task: asyncio.Task):
+                if not task.cancelled() and task.exception():
+                    self.log(f"Panel snapshot failed: {task.exception()!r}")
+
+            self.refresh.add_done_callback(done)
+        return self.refresh
+
+    @contextlib.asynccontextmanager
+    async def _camera(self, wait: float):
+        try:
+            async with asyncio.timeout(wait):
+                await self.camera_lock.acquire()
+        except TimeoutError:
+            raise RuntimeError("The panel camera is already busy") from None
+        try:
+            yield
+        finally:
+            self.camera_lock.release()
+
+    async def _capture_picture(self) -> bytes:
         async with self.camera_lock:
             # Recheck after waiting for another picture request.
             if cached := self._cached_picture():
@@ -318,9 +358,7 @@ class PanelClient:
             raise ValueError(f"Preview duration must be between 4 and {MAX_PREVIEW_SECONDS} seconds")
         if emit is not None and parameters is None:
             raise ValueError("Calibrate codec parameters before requesting live preview")
-        if self.camera_lock.locked():
-            raise RuntimeError("The panel camera is already busy")
-        async with self.camera_lock:
+        async with self._camera(CAMERA_WAIT_SECONDS):
             resume_motion = await self.preflight()
             await self.connect()
             if self.clock_offset is None or time.monotonic() - self.clock_learned >= CLOCK_REUSE_SECONDS:

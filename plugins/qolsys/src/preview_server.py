@@ -105,6 +105,10 @@ class PreviewServer:
             await holder.close()
             if drain := getattr(self.client, "drain_cleanups", None):
                 await drain()
+            # The scene may have changed while the camera was busy; refresh the still.
+            if refresh := getattr(self.client, "refresh_picture", None):
+                self.client.last_picture_time = 0
+                refresh()
             self.state = "Ready" if self.error is None else "Preview failed"
             self.finished.set()
 

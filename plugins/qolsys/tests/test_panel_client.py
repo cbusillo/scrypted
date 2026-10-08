@@ -345,6 +345,44 @@ async def test_recording_stopped_before_it_is_named_still_removes_its_record(cli
     assert client.deleted and 2 in transactions(client)
 
 
+@pytest.mark.asyncio
+async def test_slow_still_answers_with_latest_picture_then_updates(client, monkeypatch):
+    import panel_client
+    monkeypatch.setattr(panel_client, "STALE_WAIT_SECONDS", 0.05)
+    client.last_jpeg = b"older jpeg"
+    release = asyncio.Event()
+
+    async def slow_capture():
+        await release.wait()
+        return SimpleNamespace(jpeg=b"fresh jpeg", filename="clock_100.jpg")
+
+    client.controller.commands.camera.capture_snapshot = slow_capture
+    assert await client.take_picture() == b"older jpeg"
+    release.set()
+    await client.refresh
+    assert await client.take_picture() == b"fresh jpeg"
+
+
+@pytest.mark.asyncio
+async def test_live_view_waits_for_a_still_capture(client):
+    release = asyncio.Event()
+
+    async def slow_capture():
+        await release.wait()
+        return SimpleNamespace(jpeg=b"fresh jpeg", filename="clock_100.jpg")
+
+    client.controller.commands.camera.capture_snapshot = slow_capture
+    still = asyncio.create_task(client.take_picture())
+    await asyncio.sleep(0)
+    preview = asyncio.create_task(client.capture_preview(4))
+    await asyncio.sleep(0.1)
+    assert not preview.done()  # waiting for the camera, not failing
+    release.set()
+    assert await still == b"fresh jpeg"
+    await preview
+    assert client.removed and client.deleted
+
+
 def signed_in_client(tmp_path, monkeypatch, connect_result):
     c = PanelClient(tmp_path, "192.0.2.1", "192.0.2.2", "02:00:00:00:00:01")
 
