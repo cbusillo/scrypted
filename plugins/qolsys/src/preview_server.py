@@ -76,7 +76,8 @@ class PreviewServer:
         async def produce():
             deadline = loop.time() + self.max_view_seconds
             while True:
-                self.parameters = await self.client.capture_preview(self.seconds, holder.feed, self.parameters)
+                self.parameters = await self.client.capture_preview(self.seconds, holder.feed, self.parameters,
+                                                                    defer_cleanup=True)
                 if loop.time() >= deadline:
                     return self.parameters
 
@@ -102,6 +103,8 @@ class PreviewServer:
                 await producer
             gone.cancel()
             await holder.close()
+            if drain := getattr(self.client, "drain_cleanups", None):
+                await drain()
             self.state = "Ready" if self.error is None else "Preview failed"
             self.finished.set()
 

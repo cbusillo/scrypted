@@ -29,6 +29,10 @@ MAX_ENCODED_BYTES = 20_000_000
 # request timeout. Calibration and the viewer preview both stay inside this.
 MAX_PREVIEW_SECONDS = 12
 SNAPSHOT_INTERVAL_SECONDS = 30
+# Each poll downloads the whole growing clip; poll again almost at once, and
+# recheck the arming and power state on a slower clock.
+POLL_PAUSE_SECONDS = 0.2
+PREFLIGHT_SECONDS = 2
 # Reuse the panel-minus-local clock offset learned from earlier files instead of
 # taking a snapshot before every chained preview segment.
 CLOCK_REUSE_SECONDS = 600
@@ -54,6 +58,7 @@ class PanelClient:
         self.tasks: list[asyncio.Task] = []
         self.connection_lock = asyncio.Lock()
         self.log: Callable[[str], None] = print
+        self.cleanups: set[asyncio.Future] = set()
         self.camera_lock = asyncio.Lock()
         self.last_jpeg: bytes | None = None
         self.last_picture_time = 0.0
@@ -301,9 +306,14 @@ class PanelClient:
 
     async def capture_preview(
         self, seconds: float, emit: Callable[[bytes], Awaitable[None]] | None = None,
-        parameters: H264Parameters | None = None,
+        parameters: H264Parameters | None = None, defer_cleanup: bool = False,
     ) -> H264Parameters:
-        """One bounded recording. No looping, prebuffering, or unattended recording."""
+        """One bounded recording. No looping, prebuffering, or unattended recording.
+
+        With defer_cleanup, removing the clip's file and record runs in the
+        background so a chained preview can start its next clip at once;
+        drain_cleanups() waits for it.
+        """
         if not 4 <= seconds <= MAX_PREVIEW_SECONDS:
             raise ValueError(f"Preview duration must be between 4 and {MAX_PREVIEW_SECONDS} seconds")
         if emit is not None and parameters is None:
@@ -350,41 +360,43 @@ class PanelClient:
             filename = None
             reader = GrowingH264Reader(parameters) if parameters else None
             failure: BaseException | None = None
-            budget = asyncio.timeout(seconds)
             try:
                 self.recording_started = time.time()
                 await self.ipc(1, [{"dataType": "int", "dataValue": 0},
                                    {"dataType": "string", "dataValue": ident},
                                    {"dataType": "string", "dataValue": "/sdcard/PeekInPhotos"},
                                    {"dataType": "string", "dataValue": DESCRIPTION}])
-                async with budget:
-                    while True:
-                        await asyncio.sleep(1)
+                # A poll that runs past the end still finishes: the panel answers
+                # requests in order, so abandoning a download would only delay the stop.
+                deadline = time.monotonic() + seconds
+                checked = time.monotonic()
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(POLL_PAUSE_SECONDS)
+                    if time.monotonic() - checked >= PREFLIGHT_SECONDS:
                         await self.preflight()
-                        raw = None
-                        if filename:
-                            raw = await self.read_video(filename)
-                        else:
-                            # Native time of the recording start, from the learned clock offset.
-                            expected = int(self.recording_started + self.clock_offset)
-                            for stamp in sorted(range(expected - 3, expected + 4), key=lambda v: abs(v - expected)):
-                                candidate = f"{ident}_{stamp}.mp4"
-                                raw = await self.read_video(candidate)
-                                if raw:
-                                    filename = candidate
-                                    break
-                        if raw and reader and emit:
-                            packet = reader.feed(raw)
-                            if packet:
-                                await emit(packet)
-            except TimeoutError as error:
-                if not budget.expired():
-                    failure = error
+                        checked = time.monotonic()
+                    raw = None
+                    if filename:
+                        raw = await self.read_video(filename)
+                    else:
+                        # Native time of the recording start, from the learned clock offset.
+                        expected = int(self.recording_started + self.clock_offset)
+                        for stamp in sorted(range(expected - 3, expected + 4), key=lambda v: abs(v - expected)):
+                            candidate = f"{ident}_{stamp}.mp4"
+                            raw = await self.read_video(candidate)
+                            if raw:
+                                filename = candidate
+                                break
+                    if raw and reader and emit:
+                        packet = reader.feed(raw)
+                        if packet:
+                            await emit(packet)
             except BaseException as error:
                 failure = error
             finally:
                 # Stop, resume motion, and remove the exact file even on cancellation.
-                cleanup = asyncio.create_task(self._finish_preview(ident, filename, reader, guard, resume_motion))
+                cleanup = asyncio.create_task(
+                    self._finish_preview(ident, filename, reader, guard, resume_motion, defer_cleanup))
                 try:
                     final_parameters, tail = await asyncio.shield(cleanup)
                 except asyncio.CancelledError as error:
@@ -394,6 +406,11 @@ class PanelClient:
                     raise RuntimeError(f"Preview cleanup needs recovery; request ID: {ident}") from error
             if failure is not None:
                 raise failure
+            if final_parameters is None:
+                # Stopped before the panel named its file; nothing to decode.
+                if parameters is None:
+                    raise RuntimeError("Preview callback filename unavailable")
+                final_parameters = parameters
             if tail and emit:
                 await emit(tail)
             return final_parameters
@@ -402,13 +419,14 @@ class PanelClient:
         self.clock_offset = native_epoch - local_time
         self.clock_learned = time.monotonic()
 
-    async def _finish_preview(self, ident, filename, reader, guard, resume_motion):
+    async def _finish_preview(self, ident, filename, reader, guard, resume_motion, defer=False):
         stopped = await self.stop_recording(ident, resume_motion)
         # Keep the watchdog while an alarm holds off stopping our recording.
         if guard.returncode is None and (stopped or await self.recording_finished(ident)):
             guard.terminate()
             await guard.wait()
-        for _ in range(8):
+        # The file keeps the name it had while recording; ask only if it was never found.
+        for _ in range(0 if filename else 8):
             response = await self.request("database", {
                 "dbOperation": "read", "uri": CAMERA_URI, "projection": "[name]",
                 "selection": f"request_id='{ident}'",
@@ -420,8 +438,15 @@ class PanelClient:
                 break
             await asyncio.sleep(0.25)
         if not isinstance(filename, str) or not re.fullmatch(re.escape(ident) + r"_[0-9]+\.mp4", filename):
-            raise RuntimeError("Preview callback filename unavailable")
+            # A recording stopped within a second may never be named. Remove whatever exists.
+            await self._remove(self._remove_unnamed(ident), defer)
+            return None, b""
         self._learn_clock(int(filename.removesuffix(".mp4").rsplit("_", 1)[1]), self.recording_started)
+        if defer and reader is not None:
+            # Chained live view: starting the next clip beats re-downloading this
+            # whole file for its last second.
+            await self._remove(self.cleanup_video(ident, filename), defer)
+            return None, b""
         try:
             raw = await self.read_video(filename)
             if raw is None:
@@ -429,5 +454,34 @@ class PanelClient:
             parameters = H264Parameters.from_mp4(raw)
             tail = reader.feed(raw) if reader else b""
         finally:
-            await self.cleanup_video(ident, filename)
+            await self._remove(self.cleanup_video(ident, filename), defer)
         return parameters, tail
+
+    async def _remove_unnamed(self, ident: str):
+        if self.clock_offset is not None:
+            expected = int(self.recording_started + self.clock_offset)
+            for stamp in sorted(range(expected - 3, expected + 4), key=lambda v: abs(v - expected)):
+                candidate = f"{ident}_{stamp}.mp4"
+                if await self.read_video(candidate):
+                    await self.cleanup_video(ident, candidate)
+                    return
+        await self.cleanup_metadata(ident)
+
+    async def _remove(self, removal: Awaitable[None], defer: bool):
+        if not defer:
+            await removal
+            return
+        task = asyncio.ensure_future(removal)
+        self.cleanups.add(task)
+
+        def done(finished: asyncio.Future):
+            self.cleanups.discard(finished)
+            if not finished.cancelled() and finished.exception():
+                self.log(f"Preview file removal failed: {finished.exception()!r}")
+
+        task.add_done_callback(done)
+
+    async def drain_cleanups(self, timeout: float = 30):
+        """Wait for background clip removal, bounded."""
+        if self.cleanups:
+            await asyncio.wait(set(self.cleanups), timeout=timeout)

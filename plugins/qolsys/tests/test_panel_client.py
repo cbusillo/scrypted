@@ -304,6 +304,47 @@ async def test_chained_preview_reuses_panel_clock_instead_of_new_snapshot(client
     assert client.removed and client.deleted
 
 
+@pytest.mark.asyncio
+async def test_deferred_cleanup_removes_the_clip_after_returning(client):
+    parameters = H264Parameters.from_mp4(video())
+    released = asyncio.Event()
+    request = client.request
+
+    async def slow_request(event, fields):
+        if event == "ipcCall" and fields["ipcTransactionID"] == 7:
+            await released.wait()  # file removal still running when the clip returns
+        return await request(event, fields)
+
+    client.request = slow_request
+    await client.capture_preview(4, None, parameters, defer_cleanup=True)
+    assert not client.removed and client.cleanups
+    released.set()
+    await client.drain_cleanups()
+    assert client.removed and client.deleted and not client.cleanups
+
+
+@pytest.mark.asyncio
+async def test_recording_stopped_before_it_is_named_still_removes_its_record(client):
+    client.removed = True  # the panel never wrote a file
+    request = client.request
+    started = asyncio.Event()
+
+    async def unnamed(event, fields):
+        result = await request(event, fields)
+        client.stopped = False  # and never gives the recording a filename
+        if event == "ipcCall" and fields["ipcTransactionID"] == 1:
+            started.set()
+        return result
+
+    client.request = unnamed
+    task = asyncio.create_task(client.capture_preview(4, None, H264Parameters.from_mp4(video())))
+    await asyncio.wait_for(started.wait(), 3)
+    task.cancel()  # a viewer leaving within the first second
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.deleted and 2 in transactions(client)
+
+
 def signed_in_client(tmp_path, monkeypatch, connect_result):
     c = PanelClient(tmp_path, "192.0.2.1", "192.0.2.2", "02:00:00:00:00:01")
 
