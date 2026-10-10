@@ -33,7 +33,7 @@ def client(tmp_path, monkeypatch):
     c = PanelClient(tmp_path, "192.0.2.1", "192.0.2.2", "02:00:00:00:00:01")
     c.connect = AsyncMock()
     c.controller.commands.camera.capture_snapshot = AsyncMock(
-        return_value=SimpleNamespace(jpeg=b"fresh jpeg", filename="clock_100.jpg"))
+        return_value=SimpleNamespace(data=b"fresh jpeg", filename="clock_100.jpg"))
     c.calls = []
     c.ident = None
     c.removed = False
@@ -354,7 +354,7 @@ async def test_slow_still_answers_with_latest_picture_then_updates(client, monke
 
     async def slow_capture():
         await release.wait()
-        return SimpleNamespace(jpeg=b"fresh jpeg", filename="clock_100.jpg")
+        return SimpleNamespace(data=b"fresh jpeg", filename="clock_100.jpg")
 
     client.controller.commands.camera.capture_snapshot = slow_capture
     assert await client.take_picture() == b"older jpeg"
@@ -369,7 +369,7 @@ async def test_live_view_waits_for_a_still_capture(client):
 
     async def slow_capture():
         await release.wait()
-        return SimpleNamespace(jpeg=b"fresh jpeg", filename="clock_100.jpg")
+        return SimpleNamespace(data=b"fresh jpeg", filename="clock_100.jpg")
 
     client.controller.commands.camera.capture_snapshot = slow_capture
     still = asyncio.create_task(client.take_picture())

@@ -203,11 +203,11 @@ class PanelClient:
                 return cached
             await self.connect()
             snapshot = await self.controller.commands.camera.capture_snapshot()
-            self.last_jpeg = snapshot.jpeg
+            self.last_jpeg = snapshot.data
             self.last_picture_time = time.monotonic()
             # Thumbnails keep the panel clock fresh so a later preview skips its clock picture.
             self._learn_clock(int(snapshot.filename.removesuffix(".jpg").rsplit("_", 1)[1]), time.time())
-            return snapshot.jpeg
+            return snapshot.data
 
     async def preflight(self) -> bool:
         """Require an idle, disarmed, mains-powered panel; return its motion setting.
@@ -364,7 +364,7 @@ class PanelClient:
             if self.clock_offset is None or time.monotonic() - self.clock_learned >= CLOCK_REUSE_SECONDS:
                 # The panel clock drifts from ours; learn it from a fresh picture's filename.
                 clock_picture = await self.controller.commands.camera.capture_snapshot()
-                self.last_jpeg = clock_picture.jpeg
+                self.last_jpeg = clock_picture.data
                 self.last_picture_time = time.monotonic()
                 self._learn_clock(int(clock_picture.filename.removesuffix(".jpg").rsplit("_", 1)[1]), time.time())
             ident = str(uuid.uuid4())
